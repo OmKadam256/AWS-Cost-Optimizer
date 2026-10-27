@@ -1,15 +1,25 @@
 """Credential-free AWS cost optimization prototype built with Streamlit."""
 
 from datetime import datetime
+import json
 from pathlib import Path
 import secrets
 import sqlite3
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from aws_cost_optimizer.analytics import (
+    build_demo_data,
+    build_recommendations,
+    calculate_health_score,
+    detect_spend_anomalies,
+)
+from aws_cost_optimizer.assistant import answer_question
+from aws_cost_optimizer.governance import build_decision_pack, build_decision_queue, queue_dataframe
+from aws_cost_optimizer.reporting import build_account_report
 
 
 st.set_page_config(
@@ -38,6 +48,21 @@ def initialise_action_database() -> None:
             )
             """
         )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_action_history_id ON action_history(id DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decision_briefs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recommendation_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                approval TEXT NOT NULL,
+                business_constraint TEXT NOT NULL,
+                created TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_decision_briefs_id ON decision_briefs(id DESC)")
 
 
 def record_action(action: str, status: str, saving: float, sample: str) -> dict:
@@ -65,6 +90,33 @@ def load_action_history() -> list[dict]:
     return [dict(zip(["action", "status", "saving", "sample", "updated"], row)) for row in rows]
 
 
+def record_decision_brief(case: dict, constraint: str) -> dict:
+    """Persist the governance decision, separate from an infrastructure action."""
+    brief = {
+        "recommendation_id": case["recommendation_id"],
+        "title": case["title"],
+        "owner": case["owner"],
+        "approval": case["approval"],
+        "business_constraint": constraint.strip() or "No additional constraint recorded.",
+        "created": datetime.now().strftime("%b %d, %H:%M"),
+    }
+    with sqlite3.connect(ACTION_DB_PATH) as connection:
+        connection.execute(
+            "INSERT INTO decision_briefs (recommendation_id, title, owner, approval, business_constraint, created) VALUES (?, ?, ?, ?, ?, ?)",
+            tuple(brief.values()),
+        )
+    return brief
+
+
+def load_decision_briefs() -> list[dict]:
+    with sqlite3.connect(ACTION_DB_PATH) as connection:
+        rows = connection.execute(
+            "SELECT recommendation_id, title, owner, approval, business_constraint, created FROM decision_briefs ORDER BY id DESC"
+        ).fetchall()
+    fields = ["recommendation_id", "title", "owner", "approval", "business_constraint", "created"]
+    return [dict(zip(fields, row)) for row in rows]
+
+
 initialise_action_database()
 
 if "authenticated" not in st.session_state:
@@ -77,6 +129,8 @@ if "action_events" not in st.session_state:
     st.session_state.action_events = load_action_history()
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "decision_briefs" not in st.session_state:
+    st.session_state.decision_briefs = load_decision_briefs()
 
 st.markdown(
     """
@@ -161,83 +215,13 @@ if not st.session_state.authenticated:
     st.stop()
 
 
-@st.cache_data(show_spinner=False)
-def build_demo_data(seed: int):
-    """Make a new coherent set of Cost Explorer and CloudWatch-like sample data."""
-    rng = np.random.default_rng(seed)
-    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=30, freq="D")
-    base = rng.uniform(155, 235)
-    trend = np.linspace(rng.uniform(-8, 3), rng.uniform(5, 28), len(dates))
-    wave = 17 * np.sin(np.linspace(rng.uniform(0, 2), rng.uniform(3.5, 5.5), len(dates)))
-    daily_spend = np.maximum(45, base + trend + wave + rng.normal(0, 15, len(dates)))
-    spend = pd.DataFrame({"Date": dates, "Spend": daily_spend.round(2)})
-    total_30d = float(spend["Spend"].sum())
-
-    service_names = ["EC2", "S3", "RDS", "Data Transfer", "Other"]
-    shares = rng.dirichlet([3.5, 2.3, 1.3, .9, 2.1])
-    services = pd.DataFrame({"Service": service_names, "Monthly cost": (shares * total_30d).round(2)})
-    services.loc[services.index[-1], "Monthly cost"] += total_30d - services["Monthly cost"].sum()
-    services = services.sort_values("Monthly cost", ascending=True)
-
-    hours = pd.date_range(end=pd.Timestamp.now().floor("h"), periods=15 * 24, freq="h")
-    hour = hours.hour.to_numpy()
-    weekday = hours.dayofweek.to_numpy()
-    business_load = ((hour >= 8) & (hour <= 19) & (weekday < 5)).astype(float)
-    low_utilization = rng.random() < .72
-    cpu_base = rng.uniform(2.1, 3.6) if low_utilization else rng.uniform(5.1, 7.0)
-    gpu_base = rng.uniform(.4, 1.4) if low_utilization else rng.uniform(2.4, 3.8)
-    cpu = (cpu_base + business_load * rng.uniform(1.1, 2.7) + rng.normal(0, .8, len(hours))).clip(.2, 18)
-    gpu = (gpu_base + business_load * rng.uniform(.15, .65) + rng.normal(0, .28, len(hours))).clip(0, 8)
-    telemetry = pd.DataFrame({"Timestamp": hours, "CPU %": cpu, "GPU %": gpu})
-
-    object_count = int(rng.integers(180, 420))
-    object_age = rng.integers(2, 241, object_count)
-    access_days = rng.choice([0, 1, 3, 7, 30, 60, 90], p=[.25, .12, .12, .13, .14, .12, .12], size=object_count)
-    s3 = pd.DataFrame({"Age days": object_age, "Days since access": access_days})
-    cold_count = int(((s3["Age days"] >= 90) & (s3["Days since access"] >= 30)).sum())
-    eip_count = int(rng.integers(1, 4))
-    previous_total = total_30d * (1 + rng.uniform(-.14, .17))
-    budget = float(rng.integers(7800, 10800))
-    return {
-        "spend": spend,
-        "services": services,
-        "telemetry": telemetry,
-        "cold_count": cold_count,
-        "eip_count": eip_count,
-        "total_30d": total_30d,
-        "previous_total": previous_total,
-        "budget": budget,
-        "cpu_avg": float(telemetry["CPU %"].mean()),
-        "gpu_avg": float(telemetry["GPU %"].mean()),
-    }
-
-
 seed = int(st.session_state.demo_seed)
 data = build_demo_data(seed)
 services_df = data["services"]
-service_cost = dict(zip(services_df["Service"], services_df["Monthly cost"]))
+recommendations = build_recommendations(data)
+anomaly_df = detect_spend_anomalies(data["spend"])
+health = calculate_health_score(data, recommendations, anomaly_df)
 ec2_triggered = data["cpu_avg"] < 5 and data["gpu_avg"] < 3
-recommendations = []
-if ec2_triggered:
-    recommendations.append({
-        "id": "ec2-rightsize", "service": "EC2 · RIGHTSIZING",
-        "title": "Right-size underutilized instances",
-        "description": f"4 instances averaged {data['cpu_avg']:.1f}% CPU and {data['gpu_avg']:.1f}% GPU across the 15-day CloudWatch sample. Consider a smaller family while preserving workload headroom.",
-        "saving": round(service_cost["EC2"] * .13), "reason": "15-day CPU and GPU utilization", "confidence": "High confidence",
-    })
-if data["cold_count"] > 0:
-    recommendations.append({
-        "id": "s3-glacier", "service": "S3 · STORAGE LIFECYCLE",
-        "title": "Move cold objects to Glacier",
-        "description": f"{data['cold_count']} sampled objects are over 90 days old and have not been accessed for at least 30 days. A lifecycle policy can reduce storage cost.",
-        "saving": max(18, round(min(service_cost["S3"] * .16, data["cold_count"] * .72))), "reason": "Simulated S3 access log", "confidence": "Low risk",
-    })
-recommendations.append({
-    "id": "release-eip", "service": "EC2 · NETWORKING",
-    "title": "Release unattached Elastic IPs",
-    "description": f"{data['eip_count']} allocated public IPv4 addresses in this sample are unattached. Releasing unused addresses avoids hourly public IPv4 charges.",
-    "saving": round(data["eip_count"] * 3.65), "reason": "Sample resource inventory", "confidence": "Safe to apply",
-})
 
 if st.session_state.get("status_seed") != seed:
     st.session_state.action_status = {item["id"]: "Active" for item in recommendations}
@@ -246,8 +230,10 @@ else:
     for item in recommendations:
         st.session_state.action_status.setdefault(item["id"], "Active")
 
+decision_cases = build_decision_queue(recommendations, st.session_state.action_status, health)
+
 with st.container():
-    brand_col, env_col, refresh_col, logout_col = st.columns([2.35, 1.45, 1.05, .7], vertical_alignment="center")
+    brand_col, env_col, refresh_col, report_col, logout_col = st.columns([2.25, 1.35, 1.0, 1.0, .7], vertical_alignment="center")
     with brand_col:
         st.markdown('<div class="eyebrow">CLOUD FINANCIAL OPERATIONS</div><div style="font:700 1.14rem Manrope;letter-spacing:-.04em">AWS Cost Optimization</div>', unsafe_allow_html=True)
     with env_col:
@@ -257,6 +243,15 @@ with st.container():
             st.session_state.demo_seed = secrets.randbelow(900_000) + 100_000
             st.toast("Fresh sample telemetry generated", icon="✨")
             st.rerun()
+    with report_col:
+        st.download_button(
+            "Export report",
+            data=build_account_report(data, recommendations, health, anomaly_df, decision_cases),
+            file_name=f"aws-cost-report-{seed % 10000:04d}.json",
+            mime="application/json",
+            use_container_width=True,
+            help="Download the current explainable analysis as a portable JSON snapshot",
+        )
     with logout_col:
         if st.button("Log out", use_container_width=True):
             st.session_state.authenticated = False
@@ -287,7 +282,7 @@ with k4:
     st.markdown(f'<div class="kpi"><div class="kpi-label">SAVINGS IN ACTION</div><div class="kpi-value">${in_action_savings:,.0f}<small> / mo</small></div><div class="kpi-foot">Applied or scheduled · {decisions} decisions reviewed</div></div>', unsafe_allow_html=True)
 
 st.write("")
-dashboard_tab, actions_tab, chat_tab = st.tabs(["Overview", "Action Center", "AI Assistant"])
+dashboard_tab, actions_tab, decisions_tab, chat_tab = st.tabs(["Overview", "Action Center", "Decision Workspace", "AI Assistant"])
 
 with dashboard_tab:
     range_col, _ = st.columns([1, 3])
@@ -325,6 +320,33 @@ with dashboard_tab:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.markdown("**Utilization signal**  ·  15-day CloudWatch sample")
         st.markdown(f"EC2 averaged **{data['cpu_avg']:.1f}% CPU** and **{data['gpu_avg']:.1f}% GPU**. " + ("The rightsizing rule found a sustained low-utilization opportunity." if ec2_triggered else "The rightsizing thresholds were not met in this sample."))
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.write("")
+    health_col, anomaly_col = st.columns([1, 1], gap="large")
+    with health_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown("**Cost health score**  ·  Explainable account signal")
+        score_col, label_col = st.columns([1, 1], vertical_alignment="center")
+        with score_col:
+            st.metric("Overall score", f"{health['score']}/100")
+        with label_col:
+            st.markdown(f"<div class='tag'>{health['label'].upper()}</div>", unsafe_allow_html=True)
+            st.caption("Weighted from budget pacing, utilization, stability, and waste exposure.")
+        component_text = " · ".join(f"{name}: {value}" for name, value in health["components"].items())
+        st.caption(component_text)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with anomaly_col:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        anomaly_count = int(anomaly_df["Anomaly"].sum())
+        st.markdown(f"**Spend anomaly monitor**  ·  {anomaly_count} signal{'s' if anomaly_count != 1 else ''} detected")
+        if anomaly_count:
+            latest = anomaly_df[anomaly_df["Anomaly"]].iloc[-1]
+            st.warning(f"{latest['Date'].strftime('%b %d')}: ${latest['Spend']:,.0f} spend · {latest['Severity']} deviation")
+            st.caption("Signals use a rolling median and median absolute deviation, so one unusually large day does not redefine the baseline.")
+        else:
+            st.success("No unusual daily spend detected in this sample.")
+            st.caption("The monitor compares each day with its local seven-day baseline.")
         st.markdown('</div>', unsafe_allow_html=True)
     st.caption(f"Sample #{seed % 10000:04d} · Randomized offline telemetry · No AWS credentials or live resource changes")
 
@@ -374,6 +396,79 @@ with actions_tab:
             captured = sum(event["saving"] for event in st.session_state.action_events if event["status"].startswith(("Applied", "Scheduled")))
             st.caption(f"${captured:,}/mo in estimated savings have been applied or scheduled in this session. Values are illustrative, not realized AWS savings.")
 
+with decisions_tab:
+    st.markdown("### Decision Workspace")
+    st.markdown('<div class="subtle">AWS can identify an opportunity. This workspace records who must decide, which safeguards are required, and the expected business impact before a change is made.</div>', unsafe_allow_html=True)
+    st.info("This is a governance layer over cost signals—not a replacement for AWS Cost Explorer, Budgets, Anomaly Detection, or Compute Optimizer.")
+
+    open_cases = [case for case in decision_cases if case["status"] == "Needs decision"]
+    queue_col, summary_col = st.columns([1.7, 1], gap="large")
+    with queue_col:
+        st.markdown("**Decision-ready queue**")
+        st.dataframe(queue_dataframe(open_cases), hide_index=True, use_container_width=True)
+    with summary_col:
+        gated_impact = sum(case["impact_90d"] for case in open_cases)
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.metric("90-day impact awaiting decision", f"${gated_impact:,.0f}")
+        st.caption(f"{len(open_cases)} decision gate{'s' if len(open_cases) != 1 else ''} remain. Priority combines savings, confidence, and account health; it is explainable, not model-generated.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.write("")
+    if not open_cases:
+        st.success("All current opportunities have a recorded action decision. Refresh data to explore a new sample.")
+    else:
+        case_by_id = {case["recommendation_id"]: case for case in open_cases}
+        recommendation_by_id = {item["id"]: item for item in recommendations}
+        selected_id = st.selectbox(
+            "Create a decision brief for",
+            list(case_by_id),
+            format_func=lambda item_id: case_by_id[item_id]["title"],
+        )
+        selected_case = case_by_id[selected_id]
+        selected_recommendation = recommendation_by_id[selected_id]
+        detail_col, control_col = st.columns([1.15, 1], gap="large")
+        with detail_col:
+            st.markdown('<div class="panel">', unsafe_allow_html=True)
+            st.markdown(f"<div class='tag'>PRIORITY {selected_case['priority']}/100 · {selected_case['risk'].upper()} RISK</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='rec-title'>{selected_case['title']}</div>", unsafe_allow_html=True)
+            st.markdown(f"**Accountable owner:** {selected_case['owner']}  \n**Approval gate:** {selected_case['approval']}  \n**Decision due:** {selected_case['due_date']}  \n**Estimated 90-day impact:** ${selected_case['impact_90d']:,.0f}")
+            st.caption(f"Evidence source: {selected_case['evidence']}")
+            st.markdown('</div>', unsafe_allow_html=True)
+        with control_col:
+            acknowledged = st.multiselect(
+                "Required safeguards acknowledged",
+                selected_case["controls"],
+                key=f"controls-{selected_id}",
+                help="A future workflow adapter can use these checks as a precondition before it creates a change ticket or automation job.",
+            )
+            constraint = st.text_area(
+                "Business constraint or context",
+                placeholder="Example: Do not resize during month-end processing. Validate latency SLO before rollout.",
+                key=f"constraint-{selected_id}",
+            )
+            pack = build_decision_pack(selected_case, selected_recommendation, constraint)
+            left_button, right_button = st.columns(2)
+            if left_button.button("Record brief", type="primary", use_container_width=True, key=f"record-{selected_id}"):
+                if len(acknowledged) != len(selected_case["controls"]):
+                    st.error("Acknowledge every safeguard before recording this decision brief.")
+                else:
+                    st.session_state.decision_briefs.insert(0, record_decision_brief(selected_case, constraint))
+                    st.toast("Decision brief recorded in the local audit trail", icon="✅")
+            right_button.download_button(
+                "Export decision pack",
+                data=json.dumps(pack, indent=2),
+                file_name=f"decision-pack-{selected_id}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+    if st.session_state.decision_briefs:
+        with st.expander(f"Recorded decision briefs · {len(st.session_state.decision_briefs)}"):
+            brief_df = pd.DataFrame(st.session_state.decision_briefs).rename(columns={
+                "recommendation_id": "Recommendation", "title": "Opportunity", "owner": "Owner",
+                "approval": "Approval gate", "business_constraint": "Constraint", "created": "Recorded",
+            })
+            st.dataframe(brief_df, hide_index=True, use_container_width=True)
+
 with chat_tab:
     st.markdown("### Ask about this account")
     st.markdown('<div class="subtle">Answers use the sample data currently shown in your dashboard.</div>', unsafe_allow_html=True)
@@ -383,19 +478,7 @@ with chat_tab:
     prompt = st.chat_input("Try ‘Why is my bill high?’")
     if prompt:
         st.session_state.chat_history.append({"role": "user", "content": prompt})
-        query = prompt.lower()
-        if any(term in query for term in ["high", "bill", "spend", "cost"]):
-            largest = services_df.sort_values("Monthly cost", ascending=False).iloc[0]
-            answer = f"The account spent **${total_spend:,.0f}** in the last 30 days, **{abs(delta):.1f}% {delta_word}** versus its prior sample. **{largest['Service']}** is the largest service at **${largest['Monthly cost']:,.0f}**. Review current recommendations for the sample’s specific savings signals."
-        elif any(term in query for term in ["ec2", "cpu", "gpu", "instance"]):
-            result = "The rightsizing rule triggered." if ec2_triggered else "The rightsizing thresholds were not met, so no EC2 action is recommended for this sample."
-            answer = f"Across the simulated 15-day CloudWatch window, CPU averaged **{data['cpu_avg']:.1f}%** and GPU **{data['gpu_avg']:.1f}%**. {result}"
-        elif any(term in query for term in ["s3", "glacier", "storage"]):
-            answer = f"The sampled S3 access data found **{data['cold_count']}** objects older than 90 days with no access in at least 30 days. The current estimated tiering opportunity is included in the Action Center if its rule triggered."
-        elif any(term in query for term in ["save", "recommend", "action"]):
-            answer = f"There are **{len(current_items)}** open recommendations worth **${open_savings:,}/month** in this sample. **${in_action_savings:,}/month** is already applied or scheduled."
-        else:
-            answer = "I can explain the bill, EC2 utilization, S3 storage signals, or current savings recommendations."
+        answer = answer_question(prompt, data, recommendations, current_items, in_action_savings)
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
         st.rerun()
 
